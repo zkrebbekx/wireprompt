@@ -26,12 +26,13 @@ changelog:
 
 homebrew_casks:
   - # Skips publishing (binaries still release) until the HOMEBREW_TAP_TOKEN
-    # repo secret is configured.
-    skip_upload: "{{ if .Env.HOMEBREW_TAP_TOKEN }}false{{ else }}true{{ end }}"
+    # repo secret is configured. envOrDefault tolerates the key being absent
+    # entirely (e.g. the CI dry-run job).
+    skip_upload: '{{ if envOrDefault "HOMEBREW_TAP_TOKEN" "" }}false{{ else }}true{{ end }}'
     repository:
       owner: zkrebbekx
       name: homebrew-tap
-      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+      token: '{{ envOrDefault "HOMEBREW_TAP_TOKEN" "" }}'
     homepage: https://github.com/zkrebbekx/wireprompt
     description: "See every prompt, token and dollar your AI tools spend — locally"
     license: MIT
