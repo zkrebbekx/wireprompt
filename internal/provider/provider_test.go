@@ -108,6 +108,25 @@ func TestOpenAIParsing(t *testing.T) {
 	})
 }
 
+// Real-world Claude Code shape: message_start delivers the 5m/1h cache split,
+// then message_delta repeats the legacy unsplit total.
+const anthropic1hSSE = `data: {"type":"message_start","message":{"model":"claude-haiku-4-5-20251001","usage":{"input_tokens":10,"output_tokens":1,"cache_creation_input_tokens":49732,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":49732}}}}` + "\n\n" +
+	`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":55,"cache_creation_input_tokens":49732}}` + "\n\n"
+
+func TestAnthropicCacheSplitNotDoubled(t *testing.T) {
+	Convey("Given a stream where message_delta repeats the legacy cache total", t, func() {
+		Convey("When it is reassembled", func() {
+			u := Parse(FormatAnthropic, []byte(anthropic1hSSE), true)
+
+			Convey("Then the split from message_start is not double-counted", func() {
+				So(u.CacheWrite1h, ShouldEqual, 49732)
+				So(u.CacheWrite5m, ShouldEqual, 0)
+				So(u.OutputTokens, ShouldEqual, 55)
+			})
+		})
+	})
+}
+
 const geminiJSON = `{
   "modelVersion": "gemini-2.5-pro",
   "candidates": [{"content": {"parts": [

@@ -144,9 +144,11 @@ func (a anthropicUsage) apply(u *Usage) {
 	if a.CacheCreation != nil && (a.CacheCreation.Ephemeral5m > 0 || a.CacheCreation.Ephemeral1h > 0) {
 		u.CacheWrite5m = a.CacheCreation.Ephemeral5m
 		u.CacheWrite1h = a.CacheCreation.Ephemeral1h
-	} else if a.CacheCreationInputTokens > 0 {
+	} else if a.CacheCreationInputTokens > 0 && u.CacheWrite5m == 0 && u.CacheWrite1h == 0 {
 		// Older responses report only the unsplit total; bill it at the
-		// cheaper 5m tier.
+		// cheaper 5m tier. Never overwrite a split already recorded — SSE
+		// message_delta events repeat the legacy total after message_start
+		// delivered the 5m/1h breakdown, which would double-count.
 		u.CacheWrite5m = a.CacheCreationInputTokens
 	}
 }

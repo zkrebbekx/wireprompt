@@ -263,6 +263,11 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, session string, 
 	if usage.ProviderCostUSD > 0 {
 		cost, priced = usage.ProviderCostUSD, true
 	}
+	// A request with no tokens (error responses, health probes) has nothing
+	// to price — don't flag it as an unpriced model.
+	if usage.InputTokens+usage.OutputTokens+usage.CacheReadTokens+usage.CacheWrite5m+usage.CacheWrite1h == 0 {
+		priced = true
+	}
 
 	rec := store.Record{
 		StartedAt:        started,
