@@ -59,7 +59,7 @@ eval "$(wireprompt env -session myproject)"
 
 **The economics** — cost per request from per-model pricing tables (including Anthropic's 5m/1h cache-write tiers), a running "cache saved $X" ticker, context-window gauge, input-composition breakdown (system vs tools vs history vs new turn), tokens/sec and TTFT.
 
-**The workbench** — full-text search across every prompt you've ever sent, two-request diff (spot prompt drift between runs), one-click replay (auth from env, never stored), copy-as-curl.
+**The workbench** — full-text search across every prompt you've ever sent, two-request diff (spot prompt drift between runs), replay and **edit-and-replay** (tweak a captured system prompt or drop a message, resend it — a Burp Repeater for prompts; auth from env, never stored), copy-as-curl with the captured `anthropic-beta`/version headers, and `wireprompt export -session X` for a shareable Markdown transcript of an agent run.
 
 ## Providers
 

@@ -170,7 +170,21 @@ const CTX = [
   ['gpt-4.1', 1e6], ['gpt-5', 400e3], ['gpt-4o', 128e3], ['o3', 200e3], ['o4', 200e3],
   ['gemini-2.5', 1e6], ['gemini', 1e6],
 ];
-const ctxLimit = m => { m = (m||'').split('/').pop(); for (const [p, l] of CTX) if (m.startsWith(p)) return l; return 0; };
+let serverCtx = null; // [[match, context], ...] longest-first, from /api/meta
+const ctxLimit = m => {
+  m = (m||'').split('/').pop();
+  if (serverCtx) for (const [p, l] of serverCtx) if (l && m.startsWith(p)) return l;
+  for (const [p, l] of CTX) if (m.startsWith(p)) return l;
+  return 0;
+};
+async function loadMeta() {
+  try {
+    const meta = await (await api('/api/meta')).json();
+    serverCtx = (meta.pricing?.Models || meta.pricing?.models || [])
+      .map(e => [e.match, e.context || 0])
+      .sort((a, b) => b[0].length - a[0].length);
+  } catch {}
+}
 
 const state = {
   all: [],            // records, newest first
@@ -386,12 +400,14 @@ function renderDetail(d) {
     </div>
     <button id="btn-curl">copy as curl</button>
     <button id="btn-replay" title="re-sends with API keys from the server's environment">replay</button>
+    <button id="btn-edit" title="edit the request body, then resend it">edit + replay</button>
     <button id="btn-diff" title="arm this request, press d on another row">diff</button>
     <button id="btn-collapse">collapse all</button>`;
   el.append(bar);
   bar.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { state.tab = b.dataset.tab; renderDetail(d); });
   bar.querySelector('#btn-curl').onclick = () => copyText(asCurl(d));
   bar.querySelector('#btn-replay').onclick = () => replay(d.id);
+  bar.querySelector('#btn-edit').onclick = () => editReplay(d);
   bar.querySelector('#btn-diff').onclick = () => armDiff(d.id);
   bar.querySelector('#btn-collapse').onclick = () =>
     el.querySelectorAll('.msg').forEach(m => m.classList.add('collapsed'));
@@ -608,12 +624,37 @@ async function showDiff(idA, idB) {
 }
 
 // ---------- replay & curl ----------
-async function replay(id) {
+async function replay(id, body) {
   flash('replaying…');
-  const resp = await api(`/api/requests/${id}/replay`, { method: 'POST' });
+  const resp = await api(`/api/requests/${id}/replay`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body ? { request_body: body } : {}),
+  });
   if (!resp.ok) return flash('replay failed: ' + (await resp.text()).trim());
   const rec = await resp.json();
   flash(`replayed as #${rec.id} (status ${rec.status})`);
+}
+
+// The edit-and-resend workbench: swap the detail body for an editable
+// textarea of the request, send the modified version through the proxy.
+function editReplay(d) {
+  const el = $('detail');
+  let pretty = d.request_body_text;
+  try { pretty = JSON.stringify(JSON.parse(pretty), null, 2); } catch {}
+  el.innerHTML = `<h3>Edit request #${d.id} — modified body is sent with your env API keys</h3>`;
+  const ta = document.createElement('textarea');
+  ta.style.cssText = 'width:100%;height:60vh;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:.7rem;font:.84rem/1.5 ui-monospace,monospace;';
+  ta.value = pretty;
+  const send = document.createElement('button');
+  send.textContent = 'send modified request';
+  send.style.marginTop = '.6rem';
+  send.onclick = () => replay(d.id, ta.value);
+  const cancel = document.createElement('button');
+  cancel.textContent = 'back';
+  cancel.style.cssText = 'margin-top:.6rem;margin-left:.5rem';
+  cancel.onclick = () => renderDetail(d);
+  el.append(ta, send, cancel);
 }
 
 const CURL_AUTH = {
@@ -629,8 +670,11 @@ const UPSTREAM = {
 function asCurl(d) {
   const base = UPSTREAM[d.provider] || (location.origin + '/' + d.provider);
   const auth = CURL_AUTH[d.provider] || `-H 'Authorization: Bearer $API_KEY'`;
+  const extra = Object.entries(d.req_headers || {})
+    .filter(([k]) => k !== 'content-type')
+    .map(([k, v]) => `-H '${k}: ${v}' \\\n  `).join('');
   const body = (d.request_body_text || '').replace(/'/g, `'\\''`);
-  return `curl -s ${base}${d.path} \\\n  -H 'content-type: application/json' \\\n  ${auth} \\\n  -d '${body}'`;
+  return `curl -s ${base}${d.path} \\\n  -H 'content-type: application/json' \\\n  ${extra}${auth} \\\n  -d '${body}'`;
 }
 
 function copyText(t) { navigator.clipboard.writeText(t).then(() => flash('copied')); }
@@ -768,7 +812,7 @@ async function loadMore() {
 async function refreshAll() {
   const recs = await (await api('/api/requests?limit=300')).json();
   state.all = recs;
-  await Promise.all([refreshSessions(), loadTotals()]);
+  await Promise.all([refreshSessions(), loadTotals(), loadMeta()]);
   render();
 }
 

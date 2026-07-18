@@ -252,6 +252,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, session string, 
 
 	sse := provider.IsSSE(resp.Header.Get("Content-Type"))
 	usage := provider.Parse(route.Format, storedResp.buf.Bytes(), sse)
+	reqHeaders := keepHeaders(r.Header)
 	if usage.Model == "" {
 		usage.Model = provider.RequestModel(storedReq.buf.Bytes())
 	}
@@ -288,6 +289,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, session string, 
 		CacheWrite1hDup:  usage.CacheWrite1h,
 		ToolCalls:        int64(len(usage.ToolNames)),
 		ToolNames:        usage.ToolNames,
+		ReqHeaders:       reqHeaders,
 		CostUSD:          cost,
 		SavedUSD:         p.pricing.Saved(usage.Model, usage.CacheReadTokens),
 		Priced:           priced,
@@ -327,6 +329,20 @@ func (p *Proxy) record(ctx context.Context, r store.Record) {
 	}
 }
 
+// headerAllowlist are behavior-affecting request headers worth persisting for
+// faithful replays and copy-as-curl. Credentials are never on this list.
+var headerAllowlist = []string{"anthropic-version", "anthropic-beta", "openai-beta", "content-type"}
+
+func keepHeaders(h http.Header) map[string]string {
+	out := map[string]string{}
+	for _, name := range headerAllowlist {
+		if v := h.Get(name); v != "" {
+			out[name] = v
+		}
+	}
+	return out
+}
+
 // replayEnvKeys maps route formats to the env var and header used for auth.
 var replayAuth = map[provider.Format]struct{ env, header, prefix string }{
 	provider.FormatAnthropic: {"ANTHROPIC_API_KEY", "x-api-key", ""},
@@ -335,14 +351,19 @@ var replayAuth = map[provider.Format]struct{ env, header, prefix string }{
 }
 
 // Replay re-sends a stored request to its upstream using API keys from the
-// environment (keys are never stored). The replay is captured like any other
-// request, under session "replay". Returns the new record.
-func (p *Proxy) Replay(id int64) (*store.Record, error) {
+// environment (keys are never stored). A non-nil overrideBody replaces the
+// stored request body — the edit-and-resend workbench. The replay is captured
+// like any other request, under session "replay". Returns the new record.
+func (p *Proxy) Replay(id int64, overrideBody []byte) (*store.Record, error) {
 	orig, err := p.store.Get(id)
 	if err != nil {
 		return nil, fmt.Errorf("load request %d: %w", id, err)
 	}
-	if len(orig.RequestBody) == 0 {
+	body := orig.RequestBody
+	if len(overrideBody) > 0 {
+		body = overrideBody
+	}
+	if len(body) == 0 {
 		return nil, fmt.Errorf("request %d has no stored body (no-bodies mode?)", id)
 	}
 	route, ok := p.routes[orig.Provider]
@@ -358,10 +379,15 @@ func (p *Proxy) Replay(id int64) (*store.Record, error) {
 		return nil, fmt.Errorf("set %s to replay %s requests (keys are never stored)", auth.env, orig.Provider)
 	}
 
-	req := httptestRequest(orig.Method, "/s/replay/"+orig.Provider+orig.Path, orig.RequestBody)
+	req := httptestRequest(orig.Method, "/s/replay/"+orig.Provider+orig.Path, body)
 	req.Header.Set("Content-Type", "application/json")
+	// Restore the captured behavior-affecting headers (anthropic-beta etc.)
+	// so the replay reproduces the original request faithfully.
+	for k, v := range orig.ReqHeaders {
+		req.Header.Set(k, v)
+	}
 	req.Header.Set(auth.header, auth.prefix+key)
-	if route.Format == provider.FormatAnthropic {
+	if route.Format == provider.FormatAnthropic && req.Header.Get("anthropic-version") == "" {
 		req.Header.Set("anthropic-version", "2023-06-01")
 	}
 	sink := &recordSink{}

@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	_ "embed"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/zkrebbekx/wireprompt/internal/capture"
+	"github.com/zkrebbekx/wireprompt/internal/pricing"
 	"github.com/zkrebbekx/wireprompt/internal/store"
 )
 
@@ -57,16 +59,18 @@ func (f *Feed) unsubscribe(ch chan store.Record) {
 	f.mu.Unlock()
 }
 
-// Server exposes the API over a store, feed and proxy (for replays).
+// Server exposes the API over a store, feed, proxy (for replays) and the
+// pricing table (context windows for the UI gauge).
 type Server struct {
-	store *store.Store
-	feed  *Feed
-	proxy *capture.Proxy
+	store   *store.Store
+	feed    *Feed
+	proxy   *capture.Proxy
+	pricing *pricing.Table
 }
 
 // New builds the API server.
-func New(st *store.Store, feed *Feed, proxy *capture.Proxy) *Server {
-	return &Server{store: st, feed: feed, proxy: proxy}
+func New(st *store.Store, feed *Feed, proxy *capture.Proxy, table *pricing.Table) *Server {
+	return &Server{store: st, feed: feed, proxy: proxy, pricing: table}
 }
 
 // Register mounts all API and UI routes on mux.
@@ -78,6 +82,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/requests/{id}/replay", s.handleReplay)
 	mux.HandleFunc("GET /api/sessions", s.handleSessions)
 	mux.HandleFunc("GET /api/stats", s.handleStats)
+	mux.HandleFunc("GET /api/meta", s.handleMeta)
 	mux.HandleFunc("GET /api/live", s.handleLive)
 }
 
@@ -285,12 +290,27 @@ func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad id", http.StatusBadRequest)
 		return
 	}
-	rec, err := s.proxy.Replay(id)
+	// Optional JSON body {"request_body": "..."} — the edit-and-resend
+	// workbench replaces the stored request body for this replay only.
+	var override []byte
+	var payload struct {
+		RequestBody string `json:"request_body"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<20)).Decode(&payload); err == nil && payload.RequestBody != "" {
+		override = []byte(payload.RequestBody)
+	}
+	rec, err := s.proxy.Replay(id, override)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	writeJSON(w, rec)
+}
+
+// handleMeta exposes the resolved pricing table (including context windows)
+// so the UI gauge uses the same overridable data as cost computation.
+func (s *Server) handleMeta(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{"pricing": s.pricing})
 }
 
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {

@@ -33,6 +33,9 @@ type Record struct {
 	CacheWrite1hDup  int64     `json:"cache_write_1h_tokens"`
 	ToolCalls        int64     `json:"tool_calls"`
 	ToolNames        []string  `json:"tool_names,omitempty"`
+	// ReqHeaders holds a small allowlist of behavior-affecting request
+	// headers (anthropic-beta, anthropic-version, …) — never credentials.
+	ReqHeaders map[string]string `json:"req_headers,omitempty"`
 	CostUSD          float64   `json:"cost_usd"`
 	SavedUSD         float64   `json:"saved_usd"`
 	Priced           bool      `json:"priced"`
@@ -112,6 +115,7 @@ CREATE TABLE IF NOT EXISTS requests (
 	cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0,
 	tool_calls INTEGER NOT NULL DEFAULT 0,
 	tool_names TEXT NOT NULL DEFAULT '[]',
+	req_headers TEXT NOT NULL DEFAULT '{}',
 	cost_usd REAL NOT NULL DEFAULT 0,
 	saved_usd REAL NOT NULL DEFAULT 0,
 	priced INTEGER NOT NULL DEFAULT 1,
@@ -173,7 +177,14 @@ func (s *Store) migrate() error {
 	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version >= 2 {
+	if version == 2 {
+		if _, err := s.db.Exec(`ALTER TABLE requests ADD COLUMN req_headers TEXT NOT NULL DEFAULT '{}'`); err != nil {
+			return fmt.Errorf("migrate v2→v3: %w", err)
+		}
+		_, err := s.db.Exec("PRAGMA user_version = 3")
+		return err
+	}
+	if version >= 3 {
 		return nil
 	}
 	// Detect a v1 database: requests table exists with TEXT started_at.
@@ -206,7 +217,7 @@ func (s *Store) migrate() error {
 			return err
 		}
 	}
-	if _, err := tx.Exec("PRAGMA user_version = 2"); err != nil {
+	if _, err := tx.Exec("PRAGMA user_version = 3"); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -274,19 +285,31 @@ func marshalTools(names []string) string {
 	return string(b)
 }
 
+func marshalJSON(m map[string]string) string {
+	if len(m) == 0 {
+		return "{}"
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
 // Insert persists a record and sets its ID.
 func (s *Store) Insert(r *Record) error {
 	res, err := s.db.Exec(`INSERT INTO requests
 		(started_at_ms, duration_ms, ttft_ms, session, provider, model, method,
 		 path, status, streamed, input_tokens, output_tokens, cache_read_tokens,
 		 cache_write_tokens, cache_write_1h_tokens, tool_calls, tool_names,
-		 cost_usd, saved_usd, priced, request_body, response_body, error)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 req_headers, cost_usd, saved_usd, priced, request_body, response_body, error)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.StartedAt.UnixMilli(), r.DurationMS, r.TTFTMS,
 		r.Session, r.Provider, r.Model, r.Method, r.Path,
 		r.Status, r.Streamed, r.InputTokens, r.OutputTokens, r.CacheReadTokens,
 		r.CacheWriteTokens, r.CacheWrite1hDup, r.ToolCalls, marshalTools(r.ToolNames),
-		r.CostUSD, r.SavedUSD, r.Priced, r.RequestBody, r.ResponseBody, r.Error)
+		marshalJSON(r.ReqHeaders), r.CostUSD, r.SavedUSD, r.Priced,
+		r.RequestBody, r.ResponseBody, r.Error)
 	if err != nil {
 		return err
 	}
@@ -309,22 +332,23 @@ type ListOptions struct {
 const listCols = `id, started_at_ms, duration_ms, ttft_ms, session, provider,
 	model, method, path, status, streamed, input_tokens, output_tokens,
 	cache_read_tokens, cache_write_tokens, cache_write_1h_tokens, tool_calls,
-	tool_names, cost_usd, saved_usd, priced, error`
+	tool_names, req_headers, cost_usd, saved_usd, priced, error`
 
 func scanListRow(rows interface{ Scan(...any) error }) (Record, error) {
 	var r Record
 	var startedMS int64
-	var toolNames string
+	var toolNames, reqHeaders string
 	err := rows.Scan(&r.ID, &startedMS, &r.DurationMS, &r.TTFTMS, &r.Session,
 		&r.Provider, &r.Model, &r.Method, &r.Path, &r.Status, &r.Streamed,
 		&r.InputTokens, &r.OutputTokens, &r.CacheReadTokens, &r.CacheWriteTokens,
-		&r.CacheWrite1hDup, &r.ToolCalls, &toolNames, &r.CostUSD, &r.SavedUSD,
-		&r.Priced, &r.Error)
+		&r.CacheWrite1hDup, &r.ToolCalls, &toolNames, &reqHeaders, &r.CostUSD,
+		&r.SavedUSD, &r.Priced, &r.Error)
 	if err != nil {
 		return r, err
 	}
 	r.StartedAt = time.UnixMilli(startedMS).UTC()
 	json.Unmarshal([]byte(toolNames), &r.ToolNames)
+	json.Unmarshal([]byte(reqHeaders), &r.ReqHeaders)
 	return r, nil
 }
 
@@ -405,17 +429,18 @@ func (s *Store) Get(id int64) (*Record, error) {
 	row := s.db.QueryRow("SELECT "+listCols+", request_body, response_body FROM requests WHERE id = ?", id)
 	var r Record
 	var startedMS int64
-	var toolNames string
+	var toolNames, reqHeaders string
 	err := row.Scan(&r.ID, &startedMS, &r.DurationMS, &r.TTFTMS, &r.Session,
 		&r.Provider, &r.Model, &r.Method, &r.Path, &r.Status, &r.Streamed,
 		&r.InputTokens, &r.OutputTokens, &r.CacheReadTokens, &r.CacheWriteTokens,
-		&r.CacheWrite1hDup, &r.ToolCalls, &toolNames, &r.CostUSD, &r.SavedUSD,
-		&r.Priced, &r.Error, &r.RequestBody, &r.ResponseBody)
+		&r.CacheWrite1hDup, &r.ToolCalls, &toolNames, &reqHeaders, &r.CostUSD,
+		&r.SavedUSD, &r.Priced, &r.Error, &r.RequestBody, &r.ResponseBody)
 	if err != nil {
 		return nil, err
 	}
 	r.StartedAt = time.UnixMilli(startedMS).UTC()
 	json.Unmarshal([]byte(toolNames), &r.ToolNames)
+	json.Unmarshal([]byte(reqHeaders), &r.ReqHeaders)
 	return &r, nil
 }
 

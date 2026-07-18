@@ -17,6 +17,7 @@ import (
 	"github.com/zkrebbekx/wireprompt/internal/capture"
 	"github.com/zkrebbekx/wireprompt/internal/config"
 	"github.com/zkrebbekx/wireprompt/internal/demo"
+	"github.com/zkrebbekx/wireprompt/internal/export"
 	"github.com/zkrebbekx/wireprompt/internal/pricing"
 	"github.com/zkrebbekx/wireprompt/internal/runner"
 	"github.com/zkrebbekx/wireprompt/internal/store"
@@ -34,6 +35,7 @@ Usage:
   wireprompt search [-db PATH] [-limit N] <query>
   wireprompt prune  [-db PATH] -older-than 720h [-bodies-only]
   wireprompt env    [-addr 127.0.0.1:9091] [-session NAME]
+  wireprompt export -session NAME [-format markdown|jsonl] [-db PATH]
   wireprompt demo   [-db PATH]
   wireprompt version
 
@@ -101,6 +103,8 @@ func dispatch(cmd string, args []string) (int, error) {
 		return 0, cmdEnv(args)
 	case "demo":
 		return 0, cmdDemo(args)
+	case "export":
+		return 0, cmdExport(args)
 	case "version":
 		fmt.Println("wireprompt", version)
 		return 0, nil
@@ -187,7 +191,7 @@ func newServer(cfg *config.Config) (http.Handler, *store.Store, error) {
 	proxy := capture.New(st, table, cfg, routes, feed.Publish)
 
 	mux := http.NewServeMux()
-	api.New(st, feed, proxy).Register(mux)
+	api.New(st, feed, proxy, table).Register(mux)
 	mux.Handle("/", proxy)
 	return api.Secure(mux, cfg.Token), st, nil
 }
@@ -466,6 +470,29 @@ func cmdEnv(args []string) error {
 		fmt.Println("export " + kv)
 	}
 	return nil
+}
+
+func cmdExport(args []string) error {
+	fs := flag.NewFlagSet("export", flag.ExitOnError)
+	dbPath := fs.String("db", "", "database path")
+	session := fs.String("session", "", "session to export (required)")
+	format := fs.String("format", "markdown", "output format: markdown or jsonl")
+	fs.Parse(args)
+	if *session == "" {
+		return fmt.Errorf("export: -session is required (see wireprompt stats -by session)")
+	}
+	st, err := openStore(*dbPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	switch *format {
+	case "jsonl":
+		return export.JSONL(os.Stdout, st, *session)
+	case "markdown", "md":
+		return export.Markdown(os.Stdout, st, *session)
+	}
+	return fmt.Errorf("export: unknown format %q (markdown or jsonl)", *format)
 }
 
 func cmdDemo(args []string) error {

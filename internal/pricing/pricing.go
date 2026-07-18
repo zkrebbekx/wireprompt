@@ -27,6 +27,9 @@ type ModelPrice struct {
 	CacheRead    float64 `json:"cache_read"`
 	CacheWrite   float64 `json:"cache_write"`
 	CacheWrite1h float64 `json:"cache_write_1h"`
+	// Context is the model's context window in tokens (0 = unknown). Used
+	// by the UI gauge; overridable like every other field.
+	Context int64 `json:"context,omitempty"`
 }
 
 func (p ModelPrice) cacheWrite1h() float64 {
