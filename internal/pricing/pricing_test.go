@@ -55,19 +55,47 @@ func TestCost(t *testing.T) {
 		So(err, ShouldBeNil)
 
 		Convey("When costing a Sonnet request with cache activity", func() {
-			// 1M input, 1M output, 1M cache read, 1M cache write
-			got := table.Cost("claude-sonnet-5", 1_000_000, 1_000_000, 1_000_000, 1_000_000)
+			// 1M input, 1M output, 1M cache read, 1M cache write (5m)
+			got, ok := table.Cost("claude-sonnet-5", 1_000_000, 1_000_000, 1_000_000, 1_000_000, 0)
 
 			Convey("Then each bucket is billed at its own rate", func() {
+				So(ok, ShouldBeTrue)
 				So(got, ShouldAlmostEqual, 3.0+15.0+0.3+3.75, 1e-9)
 			})
 		})
 
-		Convey("When costing an unknown model", func() {
-			got := table.Cost("mystery-model-9000", 1000, 1000, 0, 0)
+		Convey("When costing with 1h cache writes", func() {
+			got, ok := table.Cost("claude-sonnet-5", 0, 0, 0, 0, 1_000_000)
 
-			Convey("Then the cost is zero", func() {
+			Convey("Then the 1h tier bills at 2x the input rate", func() {
+				So(ok, ShouldBeTrue)
+				So(got, ShouldAlmostEqual, 3.75*1.6, 1e-9) // = 6.0 = 2x input
+			})
+		})
+
+		Convey("When costing an unknown model", func() {
+			got, ok := table.Cost("mystery-model-9000", 1000, 1000, 0, 0, 0)
+
+			Convey("Then the cost is zero and flagged unpriced", func() {
 				So(got, ShouldEqual, 0)
+				So(ok, ShouldBeFalse)
+			})
+		})
+
+		Convey("When looking up an OpenRouter vendor-prefixed id", func() {
+			p, ok := table.Lookup("anthropic/claude-sonnet-5")
+
+			Convey("Then the after-slash segment matches", func() {
+				So(ok, ShouldBeTrue)
+				So(p.Input, ShouldEqual, 3.0)
+			})
+		})
+
+		Convey("When computing cache savings", func() {
+			saved := table.Saved("claude-opus-4-8", 1_000_000)
+
+			Convey("Then it is the input-rate minus cache-read-rate delta", func() {
+				So(saved, ShouldAlmostEqual, 5.0-0.5, 1e-9)
 			})
 		})
 	})

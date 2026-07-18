@@ -7,11 +7,13 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	. "github.com/smartystreets/goconvey/convey"
 
+	"github.com/zkrebbekx/wireprompt/internal/config"
 	"github.com/zkrebbekx/wireprompt/internal/pricing"
 	"github.com/zkrebbekx/wireprompt/internal/provider"
 	"github.com/zkrebbekx/wireprompt/internal/store"
@@ -26,7 +28,26 @@ const upstreamSSE = "event: message_start\n" +
 	"event: message_delta\n" +
 	`data: {"type":"message_delta","usage":{"output_tokens":9}}` + "\n\n"
 
-func newTestProxy(t *testing.T, upstream *httptest.Server) (*Proxy, *store.Store, *[]store.Record) {
+// notifyLog collects feed notifications safely across goroutines: the proxy
+// notifies from its handler goroutine while tests poll from the main one.
+type notifyLog struct {
+	mu   sync.Mutex
+	recs []store.Record
+}
+
+func (n *notifyLog) add(r store.Record) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.recs = append(n.recs, r)
+}
+
+func (n *notifyLog) snapshot() []store.Record {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]store.Record(nil), n.recs...)
+}
+
+func newTestProxy(t *testing.T, upstream *httptest.Server) (*Proxy, *store.Store, *notifyLog) {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -38,9 +59,13 @@ func newTestProxy(t *testing.T, upstream *httptest.Server) (*Proxy, *store.Store
 		t.Fatal(err)
 	}
 	u, _ := url.Parse(upstream.URL)
-	notified := &[]store.Record{}
-	p := New(st, table, []Route{{Name: "anthropic", Upstream: u, Format: provider.FormatAnthropic}},
-		func(r store.Record) { *notified = append(*notified, r) })
+	notified := &notifyLog{}
+	p := New(st, table, &config.Config{},
+		[]Route{
+			{Name: "anthropic", Upstream: u, Format: provider.FormatAnthropic},
+			{Name: "openai", Upstream: u, Format: provider.FormatOpenAI},
+		},
+		notified.add)
 	return p, st, notified
 }
 
@@ -111,8 +136,8 @@ func TestProxyJSONCapture(t *testing.T) {
 			})
 
 			Convey("Then the live feed was notified without bodies", func() {
-				So(eventually(func() bool { return len(*notified) == 1 }), ShouldBeTrue)
-				So((*notified)[0].RequestBody, ShouldBeNil)
+				So(eventually(func() bool { return len(notified.snapshot()) == 1 }), ShouldBeTrue)
+				So(notified.snapshot()[0].RequestBody, ShouldBeNil)
 			})
 		})
 	})
@@ -155,6 +180,72 @@ func TestProxySSECapture(t *testing.T) {
 				So(r.Model, ShouldEqual, "claude-haiku-4-5")
 				So(r.InputTokens, ShouldEqual, 10)
 				So(r.OutputTokens, ShouldEqual, 9)
+			})
+		})
+	})
+}
+
+func TestUsageInjection(t *testing.T) {
+	Convey("Given an OpenAI-format upstream", t, func() {
+		var upstreamSaw []byte
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			upstreamSaw, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"model":"gpt-4o","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":1}}`))
+		}))
+		defer upstream.Close()
+		p, _, _ := newTestProxy(t, upstream)
+		front := httptest.NewServer(p)
+		defer front.Close()
+
+		Convey("When a streaming request without stream_options passes through", func() {
+			resp, err := http.Post(front.URL+"/openai/v1/chat/completions", "application/json",
+				strings.NewReader(`{"model":"gpt-4o","stream":true,"messages":[]}`))
+			So(err, ShouldBeNil)
+			resp.Body.Close()
+
+			Convey("Then the proxy injected include_usage upstream", func() {
+				So(string(upstreamSaw), ShouldContainSubstring, `"include_usage":true`)
+			})
+		})
+	})
+}
+
+func TestRedactionAndNoBodies(t *testing.T) {
+	Convey("Given a proxy configured with a redaction pattern", t, func() {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(upstreamJSON))
+		}))
+		defer upstream.Close()
+		st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+		So(err, ShouldBeNil)
+		defer st.Close()
+		table, err := pricing.Load()
+		So(err, ShouldBeNil)
+		cfg := &config.Config{}
+		So(cfg.SetRedact([]string{`sk-[a-zA-Z0-9]+`}), ShouldBeNil)
+		u, _ := url.Parse(upstream.URL)
+		p := New(st, table, cfg, []Route{{Name: "anthropic", Upstream: u, Format: provider.FormatAnthropic}}, nil)
+		front := httptest.NewServer(p)
+		defer front.Close()
+
+		Convey("When a request containing a secret passes through", func() {
+			resp, err := http.Post(front.URL+"/anthropic/v1/messages", "application/json",
+				strings.NewReader(`{"model":"claude-opus-4-8","messages":[{"role":"user","content":"my key is sk-abc123DEF"}]}`))
+			So(err, ShouldBeNil)
+			resp.Body.Close()
+
+			Convey("Then the stored body is scrubbed", func() {
+				So(eventually(func() bool {
+					recs, _ := st.List(store.ListOptions{})
+					return len(recs) == 1
+				}), ShouldBeTrue)
+				recs, _ := st.List(store.ListOptions{})
+				got, err := st.Get(recs[0].ID)
+				So(err, ShouldBeNil)
+				So(string(got.RequestBody), ShouldContainSubstring, "[REDACTED]")
+				So(string(got.RequestBody), ShouldNotContainSubstring, "sk-abc123DEF")
 			})
 		})
 	})

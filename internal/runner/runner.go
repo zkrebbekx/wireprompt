@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -21,6 +23,8 @@ func Env(addr, session string) []string {
 		// OpenAI SDKs treat the base URL as including /v1.
 		"OPENAI_BASE_URL=" + base + "/openai/v1",
 		"OPENAI_API_BASE=" + base + "/openai/v1",
+		// Gemini CLI and google-genai SDKs.
+		"GOOGLE_GEMINI_BASE_URL=" + base + "/gemini",
 	}
 }
 
@@ -30,14 +34,31 @@ func DefaultSession(command string) string {
 }
 
 // Run executes the command with proxy env injected, wiring the current
-// process's stdio through, and returns the child's exit code.
+// process's stdio through, and returns the child's exit code. SIGINT is
+// delivered to the child by the terminal's process group; SIGTERM is
+// forwarded explicitly so wrapped commands shut down cleanly.
 func Run(addr, session string, command string, args []string) (int, error) {
 	cmd := exec.Command(command, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = append(os.Environ(), Env(addr, session)...)
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Start(); err != nil {
+		return 1, err
+	}
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM)
+	signal.Ignore(os.Interrupt) // child receives SIGINT from the terminal; parent survives to report
+	defer signal.Reset(os.Interrupt)
+	defer signal.Stop(sigs)
+	go func() {
+		for s := range sigs {
+			cmd.Process.Signal(s)
+		}
+	}()
+
+	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return exitErr.ExitCode(), nil
 		}
