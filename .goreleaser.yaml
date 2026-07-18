@@ -25,7 +25,10 @@ changelog:
     exclude: ["^chore", "^ci", "^docs"]
 
 homebrew_casks:
-  - repository:
+  - # Skips publishing (binaries still release) until the HOMEBREW_TAP_TOKEN
+    # repo secret is configured.
+    skip_upload: "{{ if .Env.HOMEBREW_TAP_TOKEN }}false{{ else }}true{{ end }}"
+    repository:
       owner: zkrebbekx
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
