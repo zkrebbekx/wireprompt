@@ -101,6 +101,15 @@ func Secure(next http.Handler, token string) http.Handler {
 			http.Error(w, "forbidden host", http.StatusForbidden)
 			return
 		}
+		// CSRF guard for state-changing endpoints (replay spends real API
+		// money): browsers stamp cross-site requests with
+		// Sec-Fetch-Site: cross-site; CLI clients don't send the header.
+		if r.Method != http.MethodGet {
+			if sfs := r.Header.Get("Sec-Fetch-Site"); sfs == "cross-site" {
+				http.Error(w, "cross-site request blocked", http.StatusForbidden)
+				return
+			}
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -145,6 +154,7 @@ func parseSince(v string) time.Time {
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
+	beforeID, _ := strconv.ParseInt(q.Get("before_id"), 10, 64)
 	recs, err := s.store.List(store.ListOptions{
 		Session:  q.Get("session"),
 		Model:    q.Get("model"),
@@ -152,6 +162,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		Status:   q.Get("status"),
 		Query:    q.Get("q"),
 		Since:    parseSince(q.Get("since")),
+		BeforeID: beforeID,
 		Limit:    limit,
 	})
 	if err != nil {
@@ -175,11 +186,13 @@ type Composition struct {
 
 func estimateComposition(body []byte, totalInput int64) *Composition {
 	var req struct {
-		System   json.RawMessage   `json:"system"`
-		Tools    json.RawMessage   `json:"tools"`
-		Messages []json.RawMessage `json:"messages"`
-		Input    []json.RawMessage `json:"input"` // responses API
-		Contents []json.RawMessage `json:"contents"` // gemini
+		System            json.RawMessage   `json:"system"`
+		SystemInstruction json.RawMessage   `json:"systemInstruction"` // gemini
+		Instructions      json.RawMessage   `json:"instructions"`      // responses API
+		Tools             json.RawMessage   `json:"tools"`
+		Messages          []json.RawMessage `json:"messages"`
+		Input             []json.RawMessage `json:"input"`    // responses API
+		Contents          []json.RawMessage `json:"contents"` // gemini
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil
@@ -191,14 +204,23 @@ func estimateComposition(body []byte, totalInput int64) *Composition {
 	if len(msgs) == 0 {
 		msgs = req.Contents
 	}
-	if len(msgs) == 0 && req.System == nil {
+	if len(msgs) == 0 && req.System == nil && req.SystemInstruction == nil {
 		return nil
 	}
 	chars := func(raw json.RawMessage) int64 { return int64(len(raw)) }
 	var sys, tools, hist, last int64
-	sys = chars(req.System)
+	sys = chars(req.System) + chars(req.SystemInstruction) + chars(req.Instructions)
 	tools = chars(req.Tools)
 	for i, m := range msgs {
+		// OpenAI chat carries the system prompt as a system/developer-role
+		// message; attribute it to the system bucket.
+		var role struct {
+			Role string `json:"role"`
+		}
+		if json.Unmarshal(m, &role) == nil && (role.Role == "system" || role.Role == "developer") {
+			sys += chars(m)
+			continue
+		}
 		if i == len(msgs)-1 {
 			last = chars(m)
 		} else {

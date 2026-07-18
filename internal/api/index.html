@@ -100,8 +100,8 @@
     <div><div class="v" id="t-reqs">0</div><div class="l">requests</div></div>
     <div><div class="v" id="t-in">0</div><div class="l">input tok</div></div>
     <div><div class="v" id="t-out">0</div><div class="l">output tok</div></div>
-    <div><div class="v cost" id="t-cost">$0.00</div><div class="l">total cost</div></div>
-    <div class="saved"><div class="v" id="t-saved">$0.00</div><div class="l">cache saved</div></div>
+    <div><div class="v cost" id="t-cost">$0.00</div><div class="l">cost · all time</div></div>
+    <div class="saved"><div class="v" id="t-saved">$0.00</div><div class="l">saved · all time</div></div>
   </div>
   <div class="legend">
     <span><i style="background:var(--tok-cread)"></i>cache read</span>
@@ -126,6 +126,7 @@
         </tr></thead>
         <tbody id="rows"></tbody>
       </table>
+      <div style="text-align:center;padding:.6rem"><button id="loadmore" onclick="loadMore()">load older requests</button></div>
       <div id="empty" class="placeholder" style="display:none">
         <p style="font-size:1.05rem;color:var(--text)">No traffic captured yet</p>
         <p>Wrap any AI tool:</p>
@@ -141,14 +142,30 @@
 <script>
 'use strict';
 const $ = id => document.getElementById(id);
+
+// Token-gated servers: accept ?token= once, persist, attach everywhere.
+const TOKEN = (() => {
+  const q = new URLSearchParams(location.search).get('token');
+  if (q) localStorage.setItem('wp_token', q);
+  return localStorage.getItem('wp_token') || '';
+})();
+const api = (path, opts = {}) => {
+  opts.headers = Object.assign({}, opts.headers, TOKEN ? { 'X-Wireprompt-Token': TOKEN } : {});
+  return fetch(path, opts);
+};
+const liveURL = () => '/api/live' + (TOKEN ? '?token=' + encodeURIComponent(TOKEN) : '');
 const fmt = n => n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : String(n ?? 0);
 const usd = c => '$' + (c >= 0.1 ? c.toFixed(2) : (c ?? 0).toFixed(4));
 const esc = s => { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; };
 
-// Approximate context windows for the gauge (input side).
+// Approximate context windows for the gauge (input side). Longest prefix
+// first; the older 200K-window models must precede their family prefixes.
 const CTX = [
-  ['claude-fable', 1e6], ['claude-mythos', 1e6], ['claude-opus-4', 1e6],
-  ['claude-sonnet-5', 1e6], ['claude-sonnet-4-6', 1e6], ['claude-sonnet-4', 1e6],
+  ['claude-fable', 1e6], ['claude-mythos', 1e6],
+  ['claude-opus-4-5', 200e3], ['claude-opus-4-1', 200e3], ['claude-opus-4-0', 200e3],
+  ['claude-opus-4', 1e6],
+  ['claude-sonnet-4-5', 200e3], ['claude-sonnet-4-6', 1e6],
+  ['claude-sonnet-5', 1e6], ['claude-sonnet-4', 200e3],
   ['claude-haiku', 200e3], ['claude', 200e3],
   ['gpt-4.1', 1e6], ['gpt-5', 400e3], ['gpt-4o', 128e3], ['o3', 200e3], ['o4', 200e3],
   ['gemini-2.5', 1e6], ['gemini', 1e6],
@@ -158,6 +175,8 @@ const ctxLimit = m => { m = (m||'').split('/').pop(); for (const [p, l] of CTX) 
 const state = {
   all: [],            // records, newest first
   filter: {},         // parsed DSL
+  bodyMatchIds: null, // Set of ids matched by server-side body search
+  sessionMeta: {},    // session name -> /api/sessions rollup
   selected: null,     // record id
   selectedRow: null,
   diffA: null,        // record id armed for diff
@@ -166,6 +185,7 @@ const state = {
   totals: { reqs: 0, tin: 0, tout: 0, cost: 0, saved: 0 },
   detail: null,       // current detail object
   tab: 'pretty',
+  liveCount: 0,
 };
 
 // ---------- filter DSL ----------
@@ -190,10 +210,12 @@ function matches(r, f) {
     if (f.cost.op === '>' && !(r.cost_usd > f.cost.v)) return false;
     if (f.cost.op === '<' && !(r.cost_usd < f.cost.v)) return false;
   }
-  // free text matches metadata locally; server-side q handles body search
-  for (const t of (f.text || [])) {
+  // Free text: a row passes if its metadata matches every token OR its body
+  // matched the server-side full-text search (union, not intersection).
+  if ((f.text || []).length) {
+    if (state.bodyMatchIds && state.bodyMatchIds.has(r.id)) return true;
     const hay = (r.session + ' ' + r.model + ' ' + r.provider + ' ' + r.path).toLowerCase();
-    if (!hay.includes(t)) return false;
+    for (const t of f.text) if (!hay.includes(t)) return false;
   }
   return true;
 }
@@ -213,27 +235,49 @@ function tokbar(r) {
   return `<div class="tokbar" title="read ${fmt(r.cache_read_tokens)} · write ${fmt((r.cache_write_tokens||0)+(r.cache_write_1h_tokens||0))} · fresh ${fmt(r.input_tokens)} · out ${fmt(r.output_tokens)}">${inner}</div>`;
 }
 
+function sessionHeader(sess, rows) {
+  const meta = state.sessionMeta[sess];
+  const cost = meta ? meta.cost_usd : rows.reduce((a, x) => a + x.cost_usd, 0);
+  const nreq = meta ? meta.requests : rows.length;
+  const toks = meta
+    ? meta.input_tokens + meta.cache_read_tokens + meta.output_tokens
+    : rows.reduce((a, x) => a + x.input_tokens + x.cache_read_tokens + x.output_tokens, 0);
+  const tr = document.createElement('tr');
+  tr.className = 'sess-head';
+  tr.dataset.session = sess;
+  let badges = '';
+  if (meta?.cache_bust_ids?.length) {
+    badges += ` <span class="chip" style="color:var(--red);cursor:pointer" data-bust="${meta.cache_bust_ids[0]}" title="cache invalidated at request #${meta.cache_bust_ids.join(', #')}">⚡ ${meta.cache_bust_ids.length} cache bust${meta.cache_bust_ids.length > 1 ? 's' : ''}</span>`;
+  }
+  if (meta?.tool_counts) {
+    const top = Object.entries(meta.tool_counts).sort((a, b) => b[1] - a[1]).slice(0, 3);
+    badges += ' ' + top.map(([n, c]) => `<span class="chip">⚙ ${esc(n)}×${c}</span>`).join(' ');
+  }
+  tr.innerHTML = `<td colspan="9"><span class="sname">${esc(sess)}</span>${badges}
+    <span class="sagg">${nreq} req · ${fmt(toks)} tok · <span class="cost">${usd(cost)}</span></span></td>`;
+  tr.onclick = e => {
+    const bust = e.target.dataset?.bust;
+    if (bust) { select(Number(bust), document.querySelector(`tr.req[data-id="${bust}"]`)); return; }
+    $('filter').value = 'session:' + sess; applyFilter();
+  };
+  return tr;
+}
+
 function render() {
   const tbody = $('rows');
   tbody.innerHTML = '';
   const visible = state.all.filter(r => matches(r, state.filter));
   $('empty').style.display = state.all.length ? 'none' : 'block';
-  // group consecutive rows by session (list is newest-first)
-  let cur = null;
+  // Group by session regardless of interleaving; blocks ordered by most
+  // recent activity (first appearance in the newest-first list).
+  const groups = new Map();
   for (const r of visible) {
-    if (r.session !== cur) {
-      cur = r.session;
-      const srows = visible.filter(x => x.session === cur);
-      const cost = srows.reduce((a, x) => a + x.cost_usd, 0);
-      const toks = srows.reduce((a, x) => a + x.input_tokens + x.cache_read_tokens + x.output_tokens, 0);
-      const tr = document.createElement('tr');
-      tr.className = 'sess-head';
-      tr.innerHTML = `<td colspan="9"><span class="sname">${esc(cur)}</span>
-        <span class="sagg">${srows.length} req · ${fmt(toks)} tok · <span class="cost">${usd(cost)}</span></span></td>`;
-      tr.onclick = () => { $('filter').value = 'session:' + cur; applyFilter(); };
-      tbody.append(tr);
-    }
-    tbody.append(makeRow(r));
+    if (!groups.has(r.session)) groups.set(r.session, []);
+    groups.get(r.session).push(r);
+  }
+  for (const [sess, rows] of groups) {
+    tbody.append(sessionHeader(sess, rows));
+    for (const r of rows) tbody.append(makeRow(r));
   }
 }
 
@@ -257,6 +301,9 @@ function makeRow(r) {
 }
 
 const shortModel = m => { m = m || '—'; return m.length > 26 ? m.slice(0, 25) + '…' : m; };
+// Normalizes provider request shapes: anthropic .messages, responses-API
+// .input, gemini .contents.
+const msgsOf = req => (req && (req.messages || req.input || req.contents)) || [];
 
 function bumpTotals(r) {
   const t = state.totals;
@@ -272,10 +319,11 @@ function bumpTotals(r) {
 // ---------- selection & detail ----------
 async function select(id, tr) {
   if (state.selectedRow) state.selectedRow.classList.remove('sel');
+  tr = tr || document.querySelector(`tr.req[data-id="${id}"]`) || null;
   state.selected = id; state.selectedRow = tr;
   if (tr) tr.classList.add('sel');
   pause(true);
-  const d = await (await fetch('/api/requests/' + id)).json();
+  const d = await (await api('/api/requests/' + id)).json();
   state.detail = d; state.tab = 'pretty';
   renderDetail(d);
 }
@@ -412,8 +460,8 @@ async function renderPretty(parent, d) {
   let shared = 0;
   if (d.prev_id) {
     try {
-      const prev = await (await fetch('/api/requests/' + d.prev_id)).json();
-      const prevMsgs = (JSON.parse(prev.request_body_text) || {}).messages || [];
+      const prev = await (await api('/api/requests/' + d.prev_id)).json();
+      const prevMsgs = msgsOf(JSON.parse(prev.request_body_text));
       while (shared < msgs.length - 1 && shared < prevMsgs.length &&
              JSON.stringify(msgs[shared]) === JSON.stringify(prevMsgs[shared])) shared++;
     } catch {}
@@ -519,8 +567,8 @@ function armDiff(id) {
 
 async function showDiff(idA, idB) {
   const [a, b] = await Promise.all([
-    (await fetch('/api/requests/' + idA)).json(),
-    (await fetch('/api/requests/' + idB)).json(),
+    (await api('/api/requests/' + idA)).json(),
+    (await api('/api/requests/' + idB)).json(),
   ]);
   const el = $('detail');
   el.innerHTML = `<h3>Diff: #${idA} vs #${idB}</h3><div id="diffpane"></div>`;
@@ -547,7 +595,7 @@ async function showDiff(idA, idB) {
   section('Model', ra.model, rb.model);
   section('System prompt', ra.system, rb.system);
   section('Tools', ra.tools, rb.tools);
-  const ma = ra.messages || [], mb = rb.messages || [];
+  const ma = msgsOf(ra), mb = msgsOf(rb);
   let shared = 0;
   while (shared < ma.length && shared < mb.length &&
          JSON.stringify(ma[shared]) === JSON.stringify(mb[shared])) shared++;
@@ -562,7 +610,7 @@ async function showDiff(idA, idB) {
 // ---------- replay & curl ----------
 async function replay(id) {
   flash('replaying…');
-  const resp = await fetch(`/api/requests/${id}/replay`, { method: 'POST' });
+  const resp = await api(`/api/requests/${id}/replay`, { method: 'POST' });
   if (!resp.ok) return flash('replay failed: ' + (await resp.text()).trim());
   const rec = await resp.json();
   flash(`replayed as #${rec.id} (status ${rec.status})`);
@@ -579,7 +627,7 @@ const UPSTREAM = {
   gemini: 'https://generativelanguage.googleapis.com',
 };
 function asCurl(d) {
-  const base = UPSTREAM[d.provider] || 'http://127.0.0.1:9091/' + d.provider;
+  const base = UPSTREAM[d.provider] || (location.origin + '/' + d.provider);
   const auth = CURL_AUTH[d.provider] || `-H 'Authorization: Bearer $API_KEY'`;
   const body = (d.request_body_text || '').replace(/'/g, `'\\''`);
   return `curl -s ${base}${d.path} \\\n  -H 'content-type: application/json' \\\n  ${auth} \\\n  -d '${body}'`;
@@ -613,10 +661,18 @@ function onLive(r) {
     const pill = $('newpill');
     pill.textContent = state.pending.length + ' new';
     pill.style.display = 'inline-block';
-  } else {
-    state.all.unshift(r);
-    render();
+    return;
   }
+  state.all.unshift(r);
+  // Incremental insert: a full re-render per event thrashes the DOM under
+  // parallel agent traffic. Refresh completely only periodically so session
+  // header aggregates catch up.
+  if (++state.liveCount % 25 === 0) { refreshSessions().then(render); return; }
+  if (!matches(r, state.filter)) return;
+  const head = document.querySelector(`tr.sess-head[data-session="${CSS.escape(r.session)}"]`);
+  if (head) head.after(makeRow(r));
+  else render();
+  $('empty').style.display = 'none';
 }
 $('newpill').onclick = () => pause(false);
 
@@ -629,19 +685,20 @@ $('filter').addEventListener('input', () => {
 async function applyFilter() {
   const text = $('filter').value;
   state.filter = parseFilter(text);
-  // Free text also searches bodies server-side.
+  // Free text also searches bodies server-side; body hits union with
+  // metadata hits in matches(). Rows found only in the body search but not
+  // loaded locally get appended so search covers all history.
   const q = (state.filter.text || []).join(' ');
   if (q.length >= 3) {
-    const recs = await (await fetch('/api/requests?limit=500&q=' + encodeURIComponent(q))).json();
-    const ids = new Set(recs.map(r => r.id));
-    render();
-    // keep only body-matching or metadata-matching rows
-    for (const tr of document.querySelectorAll('tr.req')) {
-      if (!ids.has(Number(tr.dataset.id))) tr.remove();
-    }
+    const recs = await (await api('/api/requests?limit=500&q=' + encodeURIComponent(q))).json();
+    state.bodyMatchIds = new Set(recs.map(r => r.id));
+    const known = new Set(state.all.map(r => r.id));
+    for (const r of recs) if (!known.has(r.id)) state.all.push(r);
+    state.all.sort((a, b) => b.id - a.id);
   } else {
-    render();
+    state.bodyMatchIds = null;
   }
+  render();
 }
 
 // ---------- keyboard ----------
@@ -673,20 +730,65 @@ document.addEventListener('keydown', e => {
 });
 
 // ---------- boot ----------
-async function boot() {
-  const recs = await (await fetch('/api/requests?limit=300')).json();
-  state.all = recs;
-  for (const r of recs) bumpTotals(r);
+async function refreshSessions() {
+  try {
+    const rows = await (await api('/api/sessions?limit=200')).json();
+    state.sessionMeta = Object.fromEntries(rows.map(r => [r.session, r]));
+  } catch {}
+}
+
+// Header totals come from /api/stats (all-time, exact) rather than summing
+// the loaded page — the loaded list is only a window into history.
+async function loadTotals() {
+  try {
+    const rows = await (await api('/api/stats')).json();
+    const t = state.totals;
+    t.reqs = rows.reduce((a, r) => a + r.requests, 0);
+    t.tin = rows.reduce((a, r) => a + r.input_tokens + r.cache_read_tokens + r.cache_write_tokens, 0);
+    t.tout = rows.reduce((a, r) => a + r.output_tokens, 0);
+    t.cost = rows.reduce((a, r) => a + r.cost_usd, 0);
+    t.saved = rows.reduce((a, r) => a + r.saved_usd, 0);
+    $('t-reqs').textContent = fmt(t.reqs);
+    $('t-in').textContent = fmt(t.tin);
+    $('t-out').textContent = fmt(t.tout);
+    $('t-cost').textContent = usd(t.cost);
+    $('t-saved').textContent = usd(t.saved);
+  } catch {}
+}
+
+async function loadMore() {
+  if (!state.all.length) return;
+  const minId = Math.min(...state.all.map(r => r.id));
+  const recs = await (await api('/api/requests?limit=300&before_id=' + minId)).json();
+  if (!recs.length) { $('loadmore').style.display = 'none'; return; }
+  state.all.push(...recs);
   render();
+}
+
+async function refreshAll() {
+  const recs = await (await api('/api/requests?limit=300')).json();
+  state.all = recs;
+  await Promise.all([refreshSessions(), loadTotals()]);
+  render();
+}
+
+async function boot() {
+  await refreshAll();
   // Deep link: /?select=<id> opens a request on load.
   const sel = Number(new URLSearchParams(location.search).get('select'));
   if (sel) {
     const tr = document.querySelector(`tr.req[data-id="${sel}"]`);
     if (tr) { tr.click(); tr.scrollIntoView({ block: 'center' }); }
   }
-  const es = new EventSource('/api/live');
+  let reconnecting = false;
+  const es = new EventSource(liveURL());
+  es.onopen = () => {
+    // A reconnect means events were missed with no replay — resync fully.
+    if (reconnecting) { reconnecting = false; refreshAll(); }
+    if (!state.paused) $('livestate').textContent = 'live';
+  };
   es.onmessage = e => onLive(JSON.parse(e.data));
-  es.onerror = () => { $('livestate').textContent = 'disconnected'; };
+  es.onerror = () => { reconnecting = true; $('livestate').textContent = 'disconnected'; };
 }
 boot();
 </script>

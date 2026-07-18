@@ -136,6 +136,12 @@ CREATE TRIGGER IF NOT EXISTS requests_fts_ad AFTER DELETE ON requests BEGIN
 	INSERT INTO requests_fts(requests_fts, rowid, request_body, response_body)
 	VALUES ('delete', old.id, old.request_body, old.response_body);
 END;
+CREATE TRIGGER IF NOT EXISTS requests_fts_au AFTER UPDATE OF request_body, response_body ON requests BEGIN
+	INSERT INTO requests_fts(requests_fts, rowid, request_body, response_body)
+	VALUES ('delete', old.id, old.request_body, old.response_body);
+	INSERT INTO requests_fts(rowid, request_body, response_body)
+	VALUES (new.id, new.request_body, new.response_body);
+END;
 `
 
 // Open opens (creating or migrating if needed) the database at path.
@@ -177,28 +183,37 @@ func (s *Store) migrate() error {
 	if err == nil && strings.Contains(ddl, "started_at TEXT") {
 		hasV1 = true
 	}
+	// The whole migration is one transaction: an interruption rolls back to
+	// the untouched v1 state instead of stranding rows in a renamed table.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	if hasV1 {
-		if _, err := s.db.Exec("ALTER TABLE requests RENAME TO requests_v1"); err != nil {
+		if _, err := tx.Exec("ALTER TABLE requests RENAME TO requests_v1"); err != nil {
 			return fmt.Errorf("migrate v1→v2: %w", err)
 		}
 	}
-	if _, err := s.db.Exec(schemaV2); err != nil {
+	if _, err := tx.Exec(schemaV2); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
 	if hasV1 {
-		if err := s.copyV1(); err != nil {
+		if err := copyV1(tx); err != nil {
 			return fmt.Errorf("migrate v1 rows: %w", err)
 		}
-		if _, err := s.db.Exec("DROP TABLE requests_v1"); err != nil {
+		if _, err := tx.Exec("DROP TABLE requests_v1"); err != nil {
 			return err
 		}
 	}
-	_, err = s.db.Exec("PRAGMA user_version = 2")
-	return err
+	if _, err := tx.Exec("PRAGMA user_version = 2"); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-func (s *Store) copyV1() error {
-	rows, err := s.db.Query(`SELECT started_at, duration_ms, ttft_ms, session,
+func copyV1(tx *sql.Tx) error {
+	rows, err := tx.Query(`SELECT started_at, duration_ms, ttft_ms, session,
 		provider, model, method, path, status, streamed, input_tokens,
 		output_tokens, cache_read_tokens, cache_write_tokens, cost_usd,
 		request_body, response_body, error FROM requests_v1 ORDER BY id`)
@@ -231,7 +246,7 @@ func (s *Store) copyV1() error {
 	}
 	for _, r := range all {
 		t, _ := time.Parse(time.RFC3339Nano, r.started)
-		if _, err := s.db.Exec(`INSERT INTO requests (started_at_ms, duration_ms,
+		if _, err := tx.Exec(`INSERT INTO requests (started_at_ms, duration_ms,
 			ttft_ms, session, provider, model, method, path, status, streamed,
 			input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
 			cost_usd, request_body, response_body, error)
@@ -287,6 +302,7 @@ type ListOptions struct {
 	Status   string // "ok" (2xx) or "err" (non-2xx)
 	Query    string // full-text search over bodies
 	Since    time.Time
+	BeforeID int64 // pagination cursor: only rows with id < BeforeID
 	Limit    int
 }
 
@@ -340,6 +356,10 @@ func (s *Store) List(o ListOptions) ([]Record, error) {
 	if !o.Since.IsZero() {
 		q += " AND started_at_ms >= ?"
 		args = append(args, o.Since.UnixMilli())
+	}
+	if o.BeforeID > 0 {
+		q += " AND id < ?"
+		args = append(args, o.BeforeID)
 	}
 	if o.Query != "" {
 		if s.fts {
@@ -536,8 +556,10 @@ func (s *Store) enrichSession(row *SessionRow) error {
 }
 
 // Prune deletes records older than cutoff. When bodiesOnly is set, bodies are
-// nulled instead of rows deleted. Returns affected row count.
-func (s *Store) Prune(cutoff time.Time, bodiesOnly bool) (int64, error) {
+// nulled instead of rows deleted. vacuum reclaims disk space afterwards — it
+// blocks the database, so callers on the startup path should pass false.
+// Returns affected row count.
+func (s *Store) Prune(cutoff time.Time, bodiesOnly, vacuum bool) (int64, error) {
 	var res sql.Result
 	var err error
 	if bodiesOnly {
@@ -550,8 +572,17 @@ func (s *Store) Prune(cutoff time.Time, bodiesOnly bool) (int64, error) {
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
-	if _, err := s.db.Exec("VACUUM"); err != nil {
-		return n, err
+	// Stripped bodies must not remain searchable: rebuild the FTS index so
+	// tokenized text of removed content leaves the disk.
+	if bodiesOnly && s.fts {
+		if _, err := s.db.Exec(`INSERT INTO requests_fts(requests_fts) VALUES('rebuild')`); err != nil {
+			return n, err
+		}
+	}
+	if vacuum {
+		if _, err := s.db.Exec("VACUUM"); err != nil {
+			return n, err
+		}
 	}
 	return n, nil
 }

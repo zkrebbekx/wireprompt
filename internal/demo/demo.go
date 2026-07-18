@@ -84,7 +84,9 @@ func Seed(st *store.Store) (int, error) {
 		rec := store.Record{
 			StartedAt: base, DurationMS: t.durMS, TTFTMS: t.ttftMS,
 			Session: Session, Provider: "anthropic", Model: demoModel,
-			Method: "POST", Path: "/v1/messages", Status: 200, Streamed: true,
+			// Bodies are stored as plain JSON, so don't mark them streamed —
+			// the Events tab would report an inconsistency.
+			Method: "POST", Path: "/v1/messages", Status: 200, Streamed: false,
 			InputTokens: t.newInput, OutputTokens: t.outputTok,
 			CacheReadTokens: t.cacheRead, CacheWriteTokens: t.cacheWrite,
 			ToolCalls: int64(len(t.tools)), ToolNames: t.tools,

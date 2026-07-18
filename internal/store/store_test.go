@@ -92,6 +92,36 @@ func TestList(t *testing.T) {
 	})
 }
 
+func TestPruneBodiesOnlyScrubsSearch(t *testing.T) {
+	Convey("Given a stored request containing a distinctive phrase", t, func() {
+		st := openTestStore(t)
+		r := sample("sess-a", "claude-opus-4-8", 0.01)
+		r.RequestBody = []byte(`{"messages":[{"role":"user","content":"the xylophone incident"}]}`)
+		So(st.Insert(r), ShouldBeNil)
+		recs, err := st.List(ListOptions{Query: "xylophone"})
+		So(err, ShouldBeNil)
+		So(len(recs), ShouldEqual, 1)
+
+		Convey("When bodies are pruned without deleting rows", func() {
+			n, err := st.Prune(time.Now().Add(time.Hour), true, false)
+			So(err, ShouldBeNil)
+			So(n, ShouldEqual, 1)
+
+			Convey("Then the phrase is no longer searchable", func() {
+				recs, err := st.List(ListOptions{Query: "xylophone"})
+				So(err, ShouldBeNil)
+				So(len(recs), ShouldEqual, 0)
+			})
+
+			Convey("Then the record itself survives without bodies", func() {
+				got, err := st.Get(r.ID)
+				So(err, ShouldBeNil)
+				So(got.RequestBody, ShouldBeNil)
+			})
+		})
+	})
+}
+
 func TestStats(t *testing.T) {
 	Convey("Given a store with records across models", t, func() {
 		st := openTestStore(t)

@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	goruntime "runtime"
 	"strings"
 	"time"
 
@@ -48,8 +50,14 @@ Config file: ~/.config/wireprompt/config.json (flags override).
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprint(os.Stderr, usage)
-		os.Exit(2)
+		// Bare `wireprompt` = the first-run path: start serving and open
+		// the UI so install-to-aha is one word.
+		openUISoon()
+		if err := cmdServe(nil); err != nil {
+			fmt.Fprintln(os.Stderr, "wireprompt:", err)
+			os.Exit(1)
+		}
+		return
 	}
 	code, err := dispatch(os.Args[1], os.Args[2:])
 	if err != nil {
@@ -57,6 +65,24 @@ func main() {
 		os.Exit(1)
 	}
 	os.Exit(code)
+}
+
+// openUISoon opens the web UI in the default browser once the server is up.
+func openUISoon() {
+	go func() {
+		time.Sleep(700 * time.Millisecond)
+		url := "http://127.0.0.1:9091/"
+		var cmd *exec.Cmd
+		switch goruntime.GOOS {
+		case "darwin":
+			cmd = exec.Command("open", url)
+		case "windows":
+			cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+		default:
+			cmd = exec.Command("xdg-open", url)
+		}
+		cmd.Run() // best effort
+	}()
 }
 
 func dispatch(cmd string, args []string) (int, error) {
@@ -142,7 +168,8 @@ func newServer(cfg *config.Config) (http.Handler, *store.Store, error) {
 	}
 	if cfg.RetentionDays > 0 {
 		cutoff := time.Now().AddDate(0, 0, -cfg.RetentionDays)
-		if _, err := st.Prune(cutoff, false); err != nil {
+		// No VACUUM on the startup path — it blocks the database.
+		if _, err := st.Prune(cutoff, false, false); err != nil {
 			fmt.Fprintf(os.Stderr, "wireprompt: retention prune failed: %v\n", err)
 		}
 	}
@@ -275,13 +302,13 @@ func cmdRun(args []string) (int, error) {
 	// Reuse a running server if one is up; otherwise start one in-process.
 	// The listen itself is the race-free claim on the port: if another run
 	// grabbed it between the health check and here, fall back to using it.
-	if !healthy(cfg.Addr) {
+	if !healthy(cfg.Addr, cfg.Token) {
 		ln, handler, st, err := listen(cfg)
 		if err == nil {
 			defer st.Close()
 			serveOn(ln, handler)
 			fmt.Fprintf(os.Stderr, "wireprompt: started proxy on %s (ui: http://%s/)\n", cfg.Addr, displayAddr(cfg.Addr))
-		} else if !healthy(cfg.Addr) {
+		} else if !healthy(cfg.Addr, cfg.Token) {
 			return 1, err
 		}
 	}
@@ -290,9 +317,16 @@ func cmdRun(args []string) (int, error) {
 	return runner.Run(cfg.Addr, *session, rest[0], rest[1:])
 }
 
-func healthy(addr string) bool {
+func healthy(addr, token string) bool {
 	c := http.Client{Timeout: 500 * time.Millisecond}
-	resp, err := c.Get("http://" + addr + "/api/health")
+	req, err := http.NewRequest("GET", "http://"+addr+"/api/health", nil)
+	if err != nil {
+		return false
+	}
+	if token != "" {
+		req.Header.Set("X-Wireprompt-Token", token)
+	}
+	resp, err := c.Do(req)
 	if err != nil {
 		return false
 	}
@@ -406,7 +440,7 @@ func cmdPrune(args []string) error {
 		return err
 	}
 	defer st.Close()
-	n, err := st.Prune(time.Now().Add(-*olderThan), *bodiesOnly)
+	n, err := st.Prune(time.Now().Add(-*olderThan), *bodiesOnly, true)
 	if err != nil {
 		return err
 	}
@@ -420,10 +454,15 @@ func cmdPrune(args []string) error {
 
 func cmdEnv(args []string) error {
 	fs := flag.NewFlagSet("env", flag.ExitOnError)
-	addr := fs.String("addr", "127.0.0.1:9091", "proxy address")
+	addr := fs.String("addr", "", "proxy address (default from config, then 127.0.0.1:9091)")
 	session := fs.String("session", "default", "session name")
 	fs.Parse(args)
-	for _, kv := range runner.Env(*addr, *session) {
+	fileCfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	cfg := resolve(fileCfg, *addr, "", "", false, nil)
+	for _, kv := range runner.Env(cfg.Addr, *session) {
 		fmt.Println("export " + kv)
 	}
 	return nil

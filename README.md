@@ -19,10 +19,11 @@ wireprompt is a single-binary local proxy that records the LLM API traffic of an
 ## Install
 
 ```sh
-brew install zkrebbekx/tap/wireprompt        # macOS
 go install github.com/zkrebbekx/wireprompt/cmd/wireprompt@latest
-# or grab a binary from Releases
+# or grab a binary from Releases — brew tap coming soon
 ```
+
+Then just run `wireprompt` — it starts the proxy and opens the UI.
 
 ## Quick start
 

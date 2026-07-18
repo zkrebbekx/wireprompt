@@ -5,6 +5,7 @@ package capture
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -199,7 +200,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, session string, 
 	resp, err := p.transport.RoundTrip(out)
 	if err != nil {
 		http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
-		p.record(store.Record{
+		p.record(r.Context(), store.Record{
 			StartedAt: started, DurationMS: time.Since(started).Milliseconds(),
 			Session: session, Provider: route.Name, Method: r.Method, Path: rest,
 			Status: http.StatusBadGateway, RequestBody: storedReq.buf.Bytes(),
@@ -296,10 +297,16 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, session string, 
 	if copyErr != nil {
 		rec.Error = copyErr.Error()
 	}
-	p.record(rec)
+	p.record(r.Context(), rec)
 }
 
-func (p *Proxy) record(r store.Record) {
+// recordSink lets internal callers (Replay) receive the exact record their
+// request produced, without racing other traffic.
+type recordSink struct{ rec *store.Record }
+
+type ctxKeySink struct{}
+
+func (p *Proxy) record(ctx context.Context, r store.Record) {
 	if p.cfg.NoBodies {
 		r.RequestBody, r.ResponseBody = nil, nil
 	} else {
@@ -309,6 +316,10 @@ func (p *Proxy) record(r store.Record) {
 	if err := p.store.Insert(&r); err != nil {
 		log.Printf("wireprompt: store insert failed: %v", err)
 		return
+	}
+	if sink, ok := ctx.Value(ctxKeySink{}).(*recordSink); ok {
+		cp := r
+		sink.rec = &cp
 	}
 	if p.notify != nil {
 		r.RequestBody, r.ResponseBody = nil, nil
@@ -353,15 +364,17 @@ func (p *Proxy) Replay(id int64) (*store.Record, error) {
 	if route.Format == provider.FormatAnthropic {
 		req.Header.Set("anthropic-version", "2023-06-01")
 	}
+	sink := &recordSink{}
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeySink{}, sink))
 
 	rw := &captureResponseWriter{header: http.Header{}}
 	p.ServeHTTP(rw, req)
 
-	recs, err := p.store.List(store.ListOptions{Session: "replay", Limit: 1})
-	if err != nil || len(recs) == 0 {
-		return nil, fmt.Errorf("replay completed (status %d) but record not found", rw.status)
+	if sink.rec == nil {
+		return nil, fmt.Errorf("replay completed (status %d) but record not captured", rw.status)
 	}
-	return &recs[0], nil
+	sink.rec.RequestBody, sink.rec.ResponseBody = nil, nil
+	return sink.rec, nil
 }
 
 func httptestRequest(method, path string, body []byte) *http.Request {
