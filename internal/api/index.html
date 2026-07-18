@@ -678,6 +678,12 @@ async function boot() {
   state.all = recs;
   for (const r of recs) bumpTotals(r);
   render();
+  // Deep link: /?select=<id> opens a request on load.
+  const sel = Number(new URLSearchParams(location.search).get('select'));
+  if (sel) {
+    const tr = document.querySelector(`tr.req[data-id="${sel}"]`);
+    if (tr) { tr.click(); tr.scrollIntoView({ block: 'center' }); }
+  }
   const es = new EventSource('/api/live');
   es.onmessage = e => onLive(JSON.parse(e.data));
   es.onerror = () => { $('livestate').textContent = 'disconnected'; };

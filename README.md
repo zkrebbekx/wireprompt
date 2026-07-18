@@ -1,6 +1,13 @@
 # wireprompt
 
+[![ci](https://github.com/zkrebbekx/wireprompt/actions/workflows/ci.yml/badge.svg)](https://github.com/zkrebbekx/wireprompt/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/zkrebbekx/wireprompt)](https://github.com/zkrebbekx/wireprompt/releases)
+[![go](https://img.shields.io/badge/go-1.23+-00ADD8?logo=go)](go.mod)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 **See every prompt, token and dollar your AI tools spend — live, locally, zero integration.**
+
+![wireprompt inspecting a captured agent session: session-grouped requests with token-composition bars on the left, conversation inspector with turn-delta collapsing, context gauge and input breakdown on the right](docs/screenshot.png)
 
 wireprompt is a single-binary local proxy that records the LLM API traffic of any tool on your machine — Claude Code, Gemini CLI, coding agents, scripts, SDK apps — and shows you what's actually on the wire: full conversations, token usage, cache behavior, cost, latency and time-to-first-token. A Wireshark for your AI tools.
 
