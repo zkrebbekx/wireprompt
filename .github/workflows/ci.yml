@@ -34,3 +34,6 @@ jobs:
       - uses: goreleaser/goreleaser-action@v6
         with:
           args: release --snapshot --clean
+        env:
+          # May be empty (fork PRs); must exist for the cask token template.
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
