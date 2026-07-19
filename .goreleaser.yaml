@@ -33,6 +33,14 @@ homebrew_casks:
       owner: zkrebbekx
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    # Unsigned binary: strip the quarantine xattr or Gatekeeper blocks the
+    # first run (hangs/dialog). Standard goreleaser recipe for CLI casks.
+    hooks:
+      post:
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/wireprompt"]
+          end
     homepage: https://github.com/zkrebbekx/wireprompt
     description: "See every prompt, token and dollar your AI tools spend — locally"
     license: MIT
